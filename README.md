@@ -35,3 +35,54 @@ go func() {
 mdns.Lookup("_foobar._tcp", entriesCh)
 close(entriesCh)
 ```
+
+### Reusable resolver with a persistent cache
+
+One-shot `Lookup`/`Query` calls open fresh listeners per call. For repeated
+or concurrent discovery, create a `Resolver` instead: all queries share one
+set of UDP listeners and one cache that aggregates SRV/A/AAAA/TXT records
+with per-record TTLs, distinguishes goodbyes from TTL expiries, and exposes
+every transition as an event.
+
+```go
+events := make(chan mdns.Event, 16)
+go func() {
+    for ev := range events {
+        fmt.Printf("service %s: %s\n", ev.Type, ev.Service)
+    }
+}()
+
+resolver, err := mdns.NewResolver(&mdns.ResolverConfig{
+    DisableIPv6: true,
+    Events:      events,
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer resolver.Close()
+
+entries := make(chan *mdns.ServiceEntry, 16)
+go func() {
+    for entry := range entries {
+        fmt.Printf("Got entry: %v\n", entry)
+    }
+}()
+
+// Several concurrent queries share the same listener; a cached instance is
+// delivered as a cache-hit instead of waiting for a new announcement.
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := resolver.QueryContext(ctx, &mdns.QueryParam{
+    Service: "_foobar._tcp",
+    Entries: entries,
+    Timeout: time.Second,
+}); err != nil {
+    log.Fatal(err)
+}
+
+// The cache can also be inspected directly at any time.
+for _, entry := range resolver.Cache().Snapshot() {
+    fmt.Printf("Cached entry: %v\n", entry)
+}
+```
+

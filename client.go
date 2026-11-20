@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +30,6 @@ type ServiceEntry struct {
 	Addr net.IP // @Deprecated
 
 	hasTXT bool
-	sent   bool
 }
 
 // complete is used to check if we have all the info we need
@@ -50,6 +48,13 @@ type QueryParam struct {
 	DisableIPv4         bool                 // Whether to disable usage of IPv4 for MDNS operations. Does not affect discovered addresses.
 	DisableIPv6         bool                 // Whether to disable usage of IPv6 for MDNS operations. Does not affect discovered addresses.
 	Logger              *log.Logger          // Optionally provide a *log.Logger to better manage log output.
+
+	// Events, when non-nil, receives the cache transitions observed while
+	// the query runs, including cache hits, new instances, updates,
+	// goodbyes and expiries. Goodbye and expiry events are not delivered
+	// on Entries. Sends are non-blocking, so use a buffered channel. Only
+	// honored by the one-shot Query/Lookup helpers.
+	Events chan<- Event
 }
 
 // DefaultParams is used to return a default set of QueryParam's
@@ -78,43 +83,29 @@ func Query(params *QueryParam) error {
 // to a channel. Sends will not block, so clients should make sure to
 // either read or buffer. QueryContext will attempt to stop the query
 // on cancellation.
+//
+// The query runs against a short-lived Resolver with its own cache; for
+// repeated or concurrent queries, create one Resolver directly so the
+// listeners and cache are shared.
 func QueryContext(ctx context.Context, params *QueryParam) error {
 	if params.Logger == nil {
 		params.Logger = log.Default()
 	}
-	// Create a new client
-	client, err := newClient(!params.DisableIPv4, !params.DisableIPv6, params.Logger)
+
+	resolver, err := NewResolver(&ResolverConfig{
+		Interface:           params.Interface,
+		DisableIPv4:         params.DisableIPv4,
+		DisableIPv6:         params.DisableIPv6,
+		WantUnicastResponse: params.WantUnicastResponse,
+		Events:              params.Events,
+		Logger:              params.Logger,
+	})
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer resolver.Close()
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			client.Close()
-		case <-client.closedCh:
-			return
-		}
-	}()
-
-	// Set the multicast interface
-	if params.Interface != nil {
-		if err := client.setInterface(params.Interface); err != nil {
-			return err
-		}
-	}
-
-	// Ensure defaults are set
-	if params.Domain == "" {
-		params.Domain = "local"
-	}
-	if params.Timeout == 0 {
-		params.Timeout = time.Second
-	}
-
-	// Run the query
-	return client.query(params)
+	return resolver.QueryContext(ctx, params)
 }
 
 // Lookup is the same as Query, however it uses all the default parameters
@@ -124,8 +115,9 @@ func Lookup(service string, entries chan<- *ServiceEntry) error {
 	return Query(params)
 }
 
-// Client provides a query interface that can be used to
-// search for service providers using mDNS
+// client owns the UDP sockets used to receive multicast and unicast mDNS
+// traffic. It is a transport only: packet interpretation and caching live in
+// Resolver and ResolverCache, so one client can be shared by many queries.
 type client struct {
 	use_ipv4 bool
 	use_ipv6 bool
@@ -137,13 +129,12 @@ type client struct {
 	ipv6MulticastConn *net.UDPConn
 
 	closed   atomic.Int32
-	closedCh chan struct{} // TODO(reddaly): This doesn't appear to be used.
+	closedCh chan struct{}
 
 	log *log.Logger
 }
 
-// NewClient creates a new mdns Client that can be used to query
-// for records
+// newClient creates a new mdns client that can be used to query for records
 func newClient(v4 bool, v6 bool, logger *log.Logger) (*client, error) {
 	if !v4 && !v6 {
 		return nil, fmt.Errorf("Must enable at least one of IPv4 and IPv6 querying") //nolint:staticcheck
@@ -279,124 +270,6 @@ type msgAddr struct {
 	src *net.UDPAddr
 }
 
-// query is used to perform a lookup and stream results
-func (c *client) query(params *QueryParam) error {
-	// Create the service name
-	serviceAddr := fmt.Sprintf("%s.%s.", trimDot(params.Service), trimDot(params.Domain))
-
-	// Start listening for response packets
-	msgCh := make(chan *msgAddr, 32)
-	if c.use_ipv4 {
-		go c.recv(c.ipv4UnicastConn, msgCh)
-		go c.recv(c.ipv4MulticastConn, msgCh)
-	}
-	if c.use_ipv6 {
-		go c.recv(c.ipv6UnicastConn, msgCh)
-		go c.recv(c.ipv6MulticastConn, msgCh)
-	}
-
-	// Send the query
-	m := new(dns.Msg)
-	m.SetQuestion(serviceAddr, dns.TypePTR)
-	// RFC 6762, section 18.12.  Repurposing of Top Bit of qclass in Question
-	// Section
-	//
-	// In the Question Section of a Multicast DNS query, the top bit of the qclass
-	// field is used to indicate that unicast responses are preferred for this
-	// particular question.  (See Section 5.4.)
-	if params.WantUnicastResponse {
-		m.Question[0].Qclass |= 1 << 15
-	}
-	m.RecursionDesired = false
-	if err := c.sendQuery(m); err != nil {
-		return err
-	}
-
-	// Map the in-progress responses
-	inprogress := make(map[string]*ServiceEntry)
-
-	// Listen until we reach the timeout
-	finish := time.After(params.Timeout)
-	for {
-		select {
-		case resp := <-msgCh:
-			var inp *ServiceEntry
-			for _, answer := range append(resp.msg.Answer, resp.msg.Extra...) {
-				// TODO(reddaly): Check that response corresponds to serviceAddr?
-				switch rr := answer.(type) {
-				case *dns.PTR:
-					// Create new entry for this
-					inp = ensureName(inprogress, rr.Ptr)
-
-				case *dns.SRV:
-					// Check for a target mismatch
-					if rr.Target != rr.Hdr.Name {
-						alias(inprogress, rr.Hdr.Name, rr.Target)
-					}
-
-					// Get the port
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Host = rr.Target
-					inp.Port = int(rr.Port)
-
-				case *dns.TXT:
-					// Pull out the txt
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Info = strings.Join(rr.Txt, "|")
-					inp.InfoFields = rr.Txt
-					inp.hasTXT = true
-
-				case *dns.A:
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.A // @Deprecated
-					inp.AddrV4 = rr.A
-
-				case *dns.AAAA:
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.AAAA   // @Deprecated
-					inp.AddrV6 = rr.AAAA // @Deprecated
-					inp.AddrV6IPAddr = &net.IPAddr{IP: rr.AAAA}
-					// link-local IPv6 addresses must be qualified with a zone (interface). Zone is
-					// specific to this machine/network-namespace and so won't be carried in the
-					// mDNS message itself. We borrow the zone from the source address of the UDP
-					// packet, as the link-local address should be valid on that interface.
-					if rr.AAAA.IsLinkLocalUnicast() || rr.AAAA.IsLinkLocalMulticast() {
-						inp.AddrV6IPAddr.Zone = resp.src.Zone
-					}
-				}
-			}
-
-			if inp == nil {
-				continue
-			}
-
-			// Check if this entry is complete
-			if inp.complete() {
-				if inp.sent {
-					continue
-				}
-				inp.sent = true
-				select {
-				case params.Entries <- inp:
-				default:
-				}
-			} else {
-				// Fire off a node specific query
-				m := new(dns.Msg)
-				m.SetQuestion(inp.Name, dns.TypePTR)
-				m.RecursionDesired = false
-				if err := c.sendQuery(m); err != nil {
-					c.log.Printf("[ERR] mdns: Failed to query instance %s: %v", inp.Name, err)
-				}
-			}
-		case <-finish:
-			return nil
-		}
-	}
-}
-
 // sendQuery is used to multicast a query out
 func (c *client) sendQuery(q *dns.Msg) error {
 	buf, err := q.Pack()
@@ -449,22 +322,4 @@ func (c *client) recv(l *net.UDPConn, msgCh chan *msgAddr) {
 			return
 		}
 	}
-}
-
-// ensureName is used to ensure the named node is in progress
-func ensureName(inprogress map[string]*ServiceEntry, name string) *ServiceEntry {
-	if inp, ok := inprogress[name]; ok {
-		return inp
-	}
-	inp := &ServiceEntry{
-		Name: name,
-	}
-	inprogress[name] = inp
-	return inp
-}
-
-// alias is used to setup an alias between two entries
-func alias(inprogress map[string]*ServiceEntry, src, dst string) {
-	srcEntry := ensureName(inprogress, src)
-	inprogress[dst] = srcEntry
 }
